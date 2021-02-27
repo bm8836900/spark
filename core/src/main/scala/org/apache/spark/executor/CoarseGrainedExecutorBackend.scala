@@ -17,7 +17,6 @@
 
 package org.apache.spark.executor
 
-import java.io.File
 import java.net.URL
 import java.nio.ByteBuffer
 import java.util.Locale
@@ -40,7 +39,7 @@ import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.resource.ResourceProfile._
 import org.apache.spark.resource.ResourceUtils._
 import org.apache.spark.rpc._
-import org.apache.spark.scheduler.{ExecutorLossReason, TaskDescription}
+import org.apache.spark.scheduler.{ExecutorLossMessage, ExecutorLossReason, TaskDescription}
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
 import org.apache.spark.serializer.SerializerInstance
 import org.apache.spark.util.{ChildFirstURLClassLoader, MutableURLClassLoader, SignalUtils, ThreadUtils, Utils}
@@ -83,12 +82,10 @@ private[spark] class CoarseGrainedExecutorBackend(
 
   override def onStart(): Unit = {
     if (env.conf.get(DECOMMISSION_ENABLED)) {
-      logInfo("Registering PWR handler to trigger decommissioning.")
-      SignalUtils.register("PWR", "Failed to register SIGPWR handler - " +
-      "disabling executor decommission feature.") {
-        self.send(ExecutorSigPWRReceived)
-        true
-      }
+      val signal = env.conf.get(EXECUTOR_DECOMMISSION_SIGNAL)
+      logInfo(s"Registering SIG$signal handler to trigger decommissioning.")
+      SignalUtils.register(signal, s"Failed to register SIG$signal handler - disabling" +
+        s" executor decommission feature.") (self.askSync[Boolean](ExecutorDecommissionSigReceived))
     }
 
     logInfo("Connecting to driver: " + driverUrl)
@@ -209,15 +206,27 @@ private[spark] class CoarseGrainedExecutorBackend(
 
     case DecommissionExecutor =>
       decommissionSelf()
+  }
 
-    case ExecutorSigPWRReceived =>
-      decommissionSelf()
-      if (driver.nonEmpty) {
-        // Tell driver we starts decommissioning so it stops trying to schedule us
-        driver.get.askSync[Boolean](ExecutorDecommissioning(executorId))
-      } else {
-        logError("No driver to message decommissioning.")
+  override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
+    case ExecutorDecommissionSigReceived =>
+      var driverNotified = false
+      try {
+        driver.foreach { driverRef =>
+          // Tell driver that we are starting decommissioning so it stops trying to schedule us
+          driverNotified = driverRef.askSync[Boolean](ExecutorDecommissioning(executorId))
+          if (driverNotified) decommissionSelf()
+        }
+      } catch {
+        case e: Exception =>
+          if (driverNotified) {
+            logError("Fail to decommission self (but driver has been notified).", e)
+          } else {
+            logError("Fail to tell driver that we are starting decommissioning", e)
+          }
+          decommissioned = false
       }
+      context.reply(decommissioned)
   }
 
   override def onDisconnected(remoteAddress: RpcAddress): Unit = {
@@ -313,13 +322,13 @@ private[spark] class CoarseGrainedExecutorBackend(
                 // since the start of computing it.
                 if (allBlocksMigrated && (migrationTime > lastTaskRunningTime)) {
                   logInfo("No running tasks, all blocks migrated, stopping.")
-                  exitExecutor(0, "Finished decommissioning", notifyDriver = true)
+                  exitExecutor(0, ExecutorLossMessage.decommissionFinished, notifyDriver = true)
                 } else {
                   logInfo("All blocks not yet migrated.")
                 }
               } else {
                 logInfo("No running tasks, no block migration configured, stopping.")
-                exitExecutor(0, "Finished decommissioning", notifyDriver = true)
+                exitExecutor(0, ExecutorLossMessage.decommissionFinished, notifyDriver = true)
               }
             } else {
               logInfo("Blocked from shutdown by running ${executor.numRunningtasks} tasks")
@@ -340,6 +349,7 @@ private[spark] class CoarseGrainedExecutorBackend(
       logInfo("Will exit when finished decommissioning")
     } catch {
       case e: Exception =>
+        decommissioned = false
         logError("Unexpected error while decommissioning self", e)
     }
   }
